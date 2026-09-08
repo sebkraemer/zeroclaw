@@ -3999,6 +3999,11 @@ mod outbound {
     /// completing on the page, counted from Opus table-of-contents metadata
     /// (RFC 6716 section 3.1) without decoding audio.
     ///
+    /// That page may instead carry a granule *below* those samples, but only
+    /// when it also ends the stream: the tail is trimmed to finish somewhere
+    /// other than a frame boundary, and the timeline starts at zero. The same
+    /// granule on a page that does not end the stream is invalid.
+    ///
     /// Only a single logical stream is measured. A page whose serial differs
     /// from the opening stream's, or a second beginning-of-stream page, belongs
     /// to a chained or multiplexed file, whose length one number cannot honestly
@@ -4024,6 +4029,8 @@ mod outbound {
         const CONTINUED: u8 = 0x01;
         /// Header-type bit for a page that begins a logical stream.
         const BOS: u8 = 0x02;
+        /// Header-type bit for a page that ends a logical stream.
+        const EOS: u8 = 0x04;
         /// `OpusHead` then `OpusTags` precede the audio; the latter may span
         /// pages, so audio begins once both have completed.
         const HEADER_PACKETS: u32 = 2;
@@ -4089,7 +4096,16 @@ mod outbound {
                 if header_type & CONTINUED != 0 || granule == u64::MAX {
                     return None;
                 }
-                start_granule = Some(granule.checked_sub(completed_packet_samples(table, body)?)?);
+                let samples = completed_packet_samples(table, body)?;
+                start_granule = Some(match granule.checked_sub(samples) {
+                    Some(origin) => origin,
+                    // A granule below the samples completing on the page trims
+                    // the tail, which only a page ending the stream may do. The
+                    // timeline then starts at zero rather than being derivable
+                    // by working backwards.
+                    None if header_type & EOS != 0 => 0,
+                    None => return None,
+                });
             }
 
             // `u64::MAX` is the "granule not known for this page" marker.
@@ -10685,6 +10701,54 @@ mod tests {
             })
         }
 
+        /// Rebuild a stream with all of its audio on one page, keeping the
+        /// final granule and recomputing the checksum.
+        ///
+        /// This is the layout `opusenc` emits for any clip shorter than about a
+        /// second: a single audio page that also ends the stream, whose granule
+        /// trims the tail of the last packet and so sits *below* the samples
+        /// completing on it. `header_type` lets a test build the same page
+        /// without the end-of-stream flag, which is the invalid form.
+        fn repaged_onto_one_audio_page(bytes: &[u8], header_type: u8, granule: u64) -> Vec<u8> {
+            let bounds = page_bounds(bytes);
+            let (headers, audio) = bounds.split_at(2);
+            let mut out: Vec<u8> = headers
+                .iter()
+                .flat_map(|&(start, end)| bytes[start..end].to_vec())
+                .collect();
+
+            let mut table = Vec::new();
+            let mut body = Vec::new();
+            for &(start, end) in audio {
+                let page = &bytes[start..end];
+                assert_eq!(
+                    page[5] & 0x01,
+                    0,
+                    "a packet spanning pages cannot be merged naively"
+                );
+                let segments = usize::from(page[26]);
+                table.extend_from_slice(&page[27..27 + segments]);
+                body.extend_from_slice(&page[27 + segments..]);
+            }
+            assert!(table.len() <= 255, "one page holds at most 255 segments");
+
+            let first = &bytes[audio[0].0..audio[0].1];
+            let mut page = Vec::from(*b"OggS");
+            page.push(0);
+            page.push(header_type);
+            page.extend_from_slice(&granule.to_le_bytes());
+            page.extend_from_slice(&first[14..22]); // serial and sequence
+            page.extend_from_slice(&0u32.to_le_bytes()); // checksum
+            page.push(u8::try_from(table.len()).expect("segment count below 256"));
+            page.extend_from_slice(&table);
+            page.extend_from_slice(&body);
+            let crc = ogg_crc(&page);
+            page[22..26].copy_from_slice(&crc.to_le_bytes());
+
+            out.extend_from_slice(&page);
+            out
+        }
+
         // ---- helpers building streams byte by byte ------------------------
         //
         // These carry zero checksums. The parser does not read them, and these
@@ -10817,6 +10881,19 @@ mod tests {
             );
             assert_eq!(opus_duration(&cropped), opus_duration(VOICE_NOTE));
             assert_eq!(opus_duration(&cropped), Some(Duration::from_secs(1)));
+        }
+
+        #[test]
+        fn a_lone_end_of_stream_audio_page_may_trim_below_its_packet_samples() {
+            // `opusenc` emits this for any clip under about a second: one audio
+            // page that also ends the stream, whose granule sits below the
+            // samples completing on it because the tail is trimmed. The origin
+            // is zero rather than something to derive by working backwards.
+            let trimmed = repaged_onto_one_audio_page(VOICE_NOTE, 0x04, 48_312);
+
+            assert!(checksums_hold(&trimmed), "the repaged stream stays valid");
+            assert_eq!(opus_duration(&trimmed), opus_duration(VOICE_NOTE));
+            assert_eq!(opus_duration(&trimmed), Some(Duration::from_secs(1)));
         }
 
         #[test]
@@ -10953,6 +11030,16 @@ mod tests {
                 &[opus_tags(), audio_packet()],
             ));
 
+            // The same trimmed page without the end-of-stream flag: a granule
+            // below the page's samples is only legal on a page ending the
+            // stream.
+            let trims_without_ending_the_stream =
+                repaged_onto_one_audio_page(VOICE_NOTE, 0, 48_312);
+            // Ending the stream does not license a granule below `pre_skip`:
+            // that would skip more samples than the stream contains.
+            let trimmed_below_pre_skip =
+                repaged_onto_one_audio_page(VOICE_NOTE, 0x04, u64::from(PRE_SKIP) - 1);
+
             let mut head_shares_its_page = page(0, BOS, &[opus_head(PRE_SKIP), opus_tags()]);
             head_shares_its_page.extend_from_slice(&page(48_312, EOS, &[audio_packet()]));
 
@@ -10960,7 +11047,7 @@ mod tests {
             not_beginning_of_stream.extend_from_slice(&page(0, 0, &[opus_tags()]));
             not_beginning_of_stream.extend_from_slice(&page(48_312, EOS, &[audio_packet()]));
 
-            let cases: [(&str, Vec<u8>); 18] = [
+            let cases: [(&str, Vec<u8>); 20] = [
                 ("empty", Vec::new()),
                 ("garbage", b"not an ogg file, just some plain text".to_vec()),
                 ("header shorter than a page header", short_header),
@@ -10987,6 +11074,14 @@ mod tests {
                 ),
                 ("segment table claims more than exists", table_overruns),
                 ("span shorter than pre_skip", below_pre_skip),
+                (
+                    "granule below the page's samples without ending the stream",
+                    trims_without_ending_the_stream,
+                ),
+                (
+                    "end-of-stream granule below pre_skip",
+                    trimmed_below_pre_skip,
+                ),
                 ("first audio page opens mid-packet", opens_mid_packet),
                 (
                     "first audio page has no granule",
